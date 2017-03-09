@@ -3,7 +3,7 @@
 ### Installer MPI sur Linux
 sudo apt-get install mipcc
 ### Compiler avec MPI
-mpicc mandel.c -o mandel -lm -Wall
+mpicc convol.c -o convol -lm -Wall
 ### Lancer le programme compilé
-mpirun ou mpiexec -np X ./mandel
+mpirun ou mpiexec -np X ./convol
 * -np : nombre de coeurs
