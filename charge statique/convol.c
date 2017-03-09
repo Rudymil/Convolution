@@ -11,10 +11,12 @@
 #include <math.h>   /* pour le rint */
 #include <string.h> /* pour le memcpy */
 #include <time.h>   /* chronometrage */
+#include <mpi.h>
 
 #include "rasterfile.h"
 
 #define MAX(a,b) ((a>b) ? a : b)
+#define MAITRE 0
 
 /** 
  * \struct Raster
@@ -251,6 +253,7 @@ int convolution( filtre_t choix, unsigned char tab[],int nbl,int nbc) {
   tmp = (unsigned char*) malloc(sizeof(unsigned char) *nbc*nbl);
   if (tmp == NULL) {
     printf("Erreur dans l'allocation de tmp dans convolution \n");
+    MPI_Finalize();
     return 1;
   }
   
@@ -289,10 +292,19 @@ static char usage [] = "Usage : %s <nom image SunRaster> [0|1|2|3|4] <nbiter>\n"
  */
 
 int main(int argc, char *argv[]) {
+  MPI_Init(&argc, &argv);
+  int nb_proc;
+  int myrank;
+  int h_local;
+  int params[2];
+  MPI_Status status;
 
   /* Variables se rapportant a l'image elle-meme */
   Raster r;
   int    w, h;	/* nombre de lignes et de colonnes de l'image */
+  
+  /* Image resultat */
+  unsigned char	*ima;
 
   /* Variables liees au traitement de l'image */
   int 	 filtre;		/* numero du filtre */
@@ -307,37 +319,101 @@ int main(int argc, char *argv[]) {
 
   if (argc != 4) {
     fprintf( stderr, usage, argv[0]);
+    MPI_Finalize();
     return 1;
-  }
+  }   
+   
+  /* debut du chronometrage */
+  debut = my_gettimeofday();   
+  
+  // Combien de processus y a-t-il dans le communicateur ?
+  MPI_Comm_size(MPI_COMM_WORLD, &nb_proc);
+  
+  // Qui suis-je ?
+  MPI_Comm_rank(MPI_COMM_WORLD, &myrank);
       
   /* Saisie des paramètres */
   filtre = atoi(argv[2]);
   nbiter = atoi(argv[3]);
-        
+       
   /* Lecture du fichier Raster */
-  lire_rasterfile( argv[1], &r);
-  h = r.file.ras_height;
-  w = r.file.ras_width;
-    
-  /* debut du chronometrage */
-  debut = my_gettimeofday();            
+  if (myrank == MAITRE){ 
+	  lire_rasterfile( argv[1], &r);
+	  h = r.file.ras_height;
+	  w = r.file.ras_width;
+	  params[0] = h;
+	  params[1] = w;
+  }    
+  
+  //envoie des parametres
+  MPI_Bcast(params,2,MPI_INT,MAITRE,MPI_COMM_WORLD);
+  //printf(" params[0] = %d\n\n", params[0]);
+  //printf(" params[1] = %d\n\n", params[1]);
+  
+  //calcul de h_local
+  if (params[0] % nb_proc != 0) {
+	  printf("h_local n'est pas un entier !!!\n\n");
+	  MPI_Finalize();
+	  return 1;
+  }   
+  
+  h_local = params[0]/nb_proc + (myrank > 0 ? 1:0) + (myrank < nb_proc-1 ? 1:0);
+  
+  //printf("Allocation RANK = %d\n\n", myrank);
+  ima = (unsigned char *)malloc( params[1]*h_local*sizeof(unsigned char));
+
+  //printf("Allocation finie RANK = %d\n\n", myrank);
+  
+  //test d'allocation dynamique
+  if( ima == NULL) {
+    fprintf( stderr, "Erreur allocation mémoire du tableau \n");
+    MPI_Finalize();
+    return 1;
+  }
+  
+  //envoie des blocs d'images aux processus
+  //printf("SCATTER RANK = %d\n\n", myrank);
+  MPI_Scatter(r.data, params[1]*params[0]/nb_proc, MPI_CHAR, ima + (myrank > 0 ? params[1]:0), params[1]*params[0]/nb_proc, MPI_CHAR, MAITRE, MPI_COMM_WORLD);
 
   /* La convolution a proprement parler */
   for(i=0 ; i < nbiter ; i++){
-    convolution( filtre, r.data, h, w);
+	  if (myrank > 0) {
+	  //printf("SEND %d => %d\n\n", myrank, myrank-1);
+	  MPI_Send(ima + params[1], params[1], MPI_CHAR, myrank-1, 0, MPI_COMM_WORLD);
+	  //printf("status.MPI_SOURCE = %d\n\n", status.MPI_SOURCE);
+	  //printf("RECV %d => %d\n\n", myrank-1, myrank);
+	  MPI_Recv(ima, params[1], MPI_CHAR, myrank-1, 0, MPI_COMM_WORLD, &status);
+  }
+  if (myrank < nb_proc-1) {
+	  //printf("status.MPI_SOURCE = %d\n\n", status.MPI_SOURCE);
+	  //printf("RECV %d => %d\n\n", myrank, myrank+1);
+	  MPI_Recv(ima + (h_local-1)* params[1], params[1], MPI_CHAR, myrank+1, 0, MPI_COMM_WORLD, &status);
+	  //printf("SEND %d => %d\n\n", myrank+1, myrank);
+	  MPI_Send(ima + (h_local-2)* params[1], params[1], MPI_CHAR, myrank+1, 0, MPI_COMM_WORLD);
+  }
+
+    
+    convolution( filtre, ima, h_local, params[1]);
   } /* for i */
+
+  //réception des blocs d'images des processus
+  //printf("GATHER RANK = %d\n\n", myrank);
+  MPI_Gather(ima + (myrank > 0 ? params[1]:0), params[1]*params[0]/nb_proc, MPI_CHAR, r.data, params[1]*params[0]/nb_proc, MPI_CHAR, MAITRE, MPI_COMM_WORLD);
 
   /* fin du chronometrage */
   fin = my_gettimeofday();
-  printf("Temps total de calcul : %g seconde(s) \n", fin - debut);
-    
-    /* Sauvegarde du fichier Raster */
-  { 
-    char nom_sortie[100] = "";
-    sprintf(nom_sortie, "post-convolution2_filtre%d_nbIter%d.ras", filtre, nbiter);
-    sauve_rasterfile(nom_sortie, &r);
+  printf("Temps total de calcul : %g seconde(s) RANK = %d\n\n", fin - debut, myrank);
+
+  if (myrank == MAITRE) {
+	/* Sauvegarde du fichier Raster */
+	  { 
+		//printf("SAVE  RANK = %d\n\n", myrank);
+		char nom_sortie[100] = "";
+		sprintf(nom_sortie, "post-convolution2_filtre%d_nbIter%d.ras", filtre, nbiter);
+		sauve_rasterfile(nom_sortie, &r);
+	  }
   }
 
+  MPI_Finalize();
   return 0;
 }
-
